@@ -1,0 +1,116 @@
+rules_version = '2';
+
+// Reglas de Firestore para QuinielaSoft.
+// Defensa en profundidad: la validación de negocio "real" vive en el backend
+// NestJS (que usa Firebase Admin SDK y se salta estas reglas), pero estas
+// reglas evitan que un cliente comprometido o mal configurado escriba
+// directo a Firestore sin pasar por el backend.
+
+function isSignedIn() {
+  return request.auth != null;
+}
+
+function isSuperAdmin() {
+  return isSignedIn() &&
+    get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isSuperAdmin == true;
+}
+
+function isGroupMember(groupId) {
+  return isSignedIn() &&
+    exists(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid)) &&
+    get(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid)).data.isActive == true;
+}
+
+function isGroupAdmin(groupId) {
+  return isGroupMember(groupId) &&
+    get(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid)).data.role == 'group_admin';
+}
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Datos globales de ligas/temporadas/rondas: lectura para cualquier usuario
+    // autenticado, escritura solo desde el backend (Admin SDK).
+    match /leagues/{leagueId} {
+      allow read: if isSignedIn();
+      allow write: if false;
+
+      match /seasons/{seasonId} {
+        allow read: if isSignedIn();
+        allow write: if false;
+
+        match /rounds/{roundId} {
+          allow read: if isSignedIn();
+          allow write: if false;
+        }
+      }
+    }
+
+    // Partidos: globales y compartidos entre grupos. Lectura para cualquier
+    // usuario autenticado, escritura solo desde el backend.
+    match /matches/{matchId} {
+      allow read: if isSignedIn();
+      allow write: if false;
+    }
+
+    // Perfil de usuario: cada quien lee/edita datos no sensibles del propio,
+    // el campo isSuperAdmin solo lo toca el backend.
+    match /users/{uid} {
+      allow read: if isSignedIn() && (request.auth.uid == uid || isSuperAdmin());
+      allow write: if false;
+    }
+
+    // Grupos: solo super-admin gestiona el documento del grupo.
+    // Los miembros pueden leer el grupo al que pertenecen.
+    match /groups/{groupId} {
+      allow read: if isGroupMember(groupId) || isSuperAdmin();
+      allow write: if isSuperAdmin();
+
+      match /members/{uid} {
+        allow read: if isGroupMember(groupId) || isSuperAdmin();
+        allow write: if isGroupAdmin(groupId) || isSuperAdmin();
+      }
+
+      match /scoringRules {
+        allow read: if isGroupMember(groupId) || isSuperAdmin();
+        allow write: if isGroupAdmin(groupId) || isSuperAdmin();
+      }
+    }
+
+    // Predicciones: el dueño de la predicción puede crear/editar la suya
+    // mientras el partido no haya iniciado; el admin de grupo puede leer las
+    // de su grupo (para debug/soporte), nunca escribirlas por otro usuario.
+    match /predictions/{predictionId} {
+      allow read: if isSignedIn() &&
+        (resource.data.userId == request.auth.uid || isGroupAdmin(resource.data.groupId) || isSuperAdmin());
+
+      allow create: if isSignedIn() &&
+        request.resource.data.userId == request.auth.uid &&
+        isGroupMember(request.resource.data.groupId) &&
+        get(/databases/$(database)/documents/matches/$(request.resource.data.matchId)).data.kickoffAt > request.time;
+
+      allow update: if isSignedIn() &&
+        resource.data.userId == request.auth.uid &&
+        get(/databases/$(database)/documents/matches/$(resource.data.matchId)).data.kickoffAt > request.time &&
+        // el usuario solo puede tocar su propio pronóstico, no los puntos ya calculados
+        request.resource.data.pointsEarned == resource.data.pointsEarned;
+
+      allow delete: if false;
+    }
+
+    // Rankings: documentos calculados por el backend, solo lectura para
+    // miembros del grupo correspondiente (cada documento guarda su propio
+    // campo groupId además de estar codificado en el ID, para que esta regla
+    // lo pueda validar sin parsear el ID).
+    match /rankings/{rankingId} {
+      allow read: if isSignedIn() && (isGroupMember(resource.data.groupId) || isSuperAdmin());
+      allow write: if false;
+    }
+
+    // Logs de sincronización: solo super-admin.
+    match /syncLogs/{logId} {
+      allow read: if isSuperAdmin();
+      allow write: if false;
+    }
+  }
+}
