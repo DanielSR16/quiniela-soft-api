@@ -9,7 +9,7 @@ export class UsersController {
 
   @Get('me')
   async getMe(@CurrentUser() user: RequestUser) {
-    const profile = await this.usersService. getProfile(user.uid);
+    const profile = await this.usersService.getProfile(user.uid);
     return { uid: user.uid, email: user.email, ...profile };
   }
 }
